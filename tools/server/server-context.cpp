@@ -1502,6 +1502,13 @@ private:
             params_base.cache_idle_slots = false;
         }
 
+        // pool-wide cache sharing needs idle slots to stay live as claim sources; clearing them
+        // into the prompt cache would free the very cells a later request wants to reuse
+        if (params_base.cache_sharing && params_base.cache_idle_slots) {
+            SRV_INF("%s", "cache sharing: disabling idle slot clearing so slots stay as claim sources\n");
+            params_base.cache_idle_slots = false;
+        }
+
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
@@ -3258,6 +3265,74 @@ private:
     };
 #endif
 
+    // pool-wide cache sharing: claim the best shared prefix for `slot` from any other slot
+    // (including busy ones) whose cached prompt shares the longest common prefix.
+    // returns the number of tokens claimed (= the new n_past), or 0 if nothing was claimed.
+    size_t claim_shared_prefix(server_slot & slot, const server_tokens & input_tokens) {
+        if (!params_base.cache_sharing || !params_base.kv_unified || input_tokens.has_media()) {
+            return 0;
+        }
+
+        // only claim into a slot with no own cached prefix: claiming over the destination's own cells
+        // would leave it owning both its cells and the overlapping claimed cells (duplicate content)
+        if (slot.prompt.tokens.get_common_prefix(input_tokens) > 0) {
+            return 0;
+        }
+
+        // find the source slot (other than `slot` itself) with the longest common prefix
+        server_slot * best_src = nullptr;
+        size_t best_lcp = 0;
+
+        for (auto & other : slots) {
+            if (&other == &slot) {
+                continue;
+            }
+
+            // only claim from a source that holds cached text tokens (skip media prompts)
+            if (other.prompt.tokens.empty() || other.prompt.tokens.has_media()) {
+                continue;
+            }
+
+            const size_t lcp = other.prompt.tokens.get_common_prefix(input_tokens);
+            if (lcp > best_lcp) {
+                best_lcp = lcp;
+                best_src = &other;
+            }
+        }
+
+        if (best_src == nullptr || best_lcp == 0) {
+            return 0;
+        }
+
+        const auto & tokens = input_tokens.get_tokens();
+        const size_t n_tokens = tokens.size();
+
+        std::vector<llama_pos> pos(n_tokens);
+        for (size_t i = 0; i < n_tokens; ++i) {
+            pos[i] = (llama_pos) i;
+        }
+
+        // drop the destination slot's own stale cells, then claim the source's prefix for it
+        slot.mem.seq_rm(slot.id, -1, -1);
+
+        const uint32_t n_claimed = slot.mem.seq_claim(
+                slot.id, best_src->id, tokens.data(), pos.data(), (uint32_t) n_tokens);
+
+        if (n_claimed == 0) {
+            return 0;
+        }
+
+        // the destination's prompt now reflects the claimed prefix
+        server_tokens claimed(input_tokens.get_tokens(), false);
+        claimed.keep_first(n_claimed);
+        slot.prompt.tokens = std::move(claimed);
+
+        SLT_INF(slot, "claimed %u tokens from slot %d (source slot %d, shared prefix)\n",
+                n_claimed, slot.id, best_src->id);
+
+        return n_claimed;
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -3703,6 +3778,9 @@ private:
                             if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+
+                                // pool-wide cache sharing: claim the best shared prefix from another slot
+                                n_past = std::max<size_t>(n_past, claim_shared_prefix(slot, input_tokens));
 
                                 // the children start from the shared prefix, do not go past it
                                 if (slot.task->n_tokens_shared > 0) {

@@ -128,6 +128,8 @@ public:
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
+    uint32_t seq_claim(llama_seq_id seq_id, llama_seq_id seq_src, const llama_token * tokens, const llama_pos * pos, uint32_t n_tokens) override;
+
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 

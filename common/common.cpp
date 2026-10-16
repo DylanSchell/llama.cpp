@@ -1656,6 +1656,11 @@ void common_memory::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, lla
     }
 }
 
+uint32_t common_memory::seq_claim(llama_seq_id seq_id, llama_seq_id seq_src,
+                                  const llama_token * tokens, const llama_pos * pos, uint32_t n_tokens) const {
+    return llama_memory_seq_claim(llama_get_memory(ctx_tgt), seq_id, seq_src, tokens, pos, n_tokens);
+}
+
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora) {
     std::vector<llama_adapter_lora *> loras;
     std::vector<float> scales;

@@ -199,6 +199,45 @@ to the new seq_id; the slot's seq_id is added to them via `seq_add`.
 - **Atomicity with batch prep.** The claim must happen before `prepare()`/`find_slot` so the batch
   only contains the non-claimed tail.
 
+### Part D - DSV4 support (full-prefix copy)
+
+`llama_kv_cache_dsv4` is deliberately per-sequence and does NOT use a unified pool, even when
+`--kv-unified` is passed (src/llama-kv-cache-dsv4.cpp: `unified_raw = false`,
+`unified_compressed = false`; the `unified` argument is `GGML_UNUSED`). It stacks:
+
+- `kv_raw` (`llama_kv_cache_iswa`) - raw/SWA token cache, per-sequence streams.
+- `kv_csa` / `kv_hca` / `kv_lid` (`llama_kv_cache`) - compressed K blocks written by the graph, per-sequence.
+- `csa_state` / `hca_state` / `lid_state` (`llama_dsv4_comp_state`) - compressor state, per-stream, NOT reference-counted.
+
+So the reference-counted `seq_claim` model does not apply: source and destination are different
+streams, the compressed rows carry no `ext.tok`, and the compressor state can only be copied.
+`seq_cp` already handles DSV4 cross-sequence reuse as a full buffer copy (used by parent/child
+slots). DSV4 therefore reuses a prefix by **copying the whole source sequence**, which is only
+valid when the source is a complete prefix of the request.
+
+`llama_kv_cache_dsv4::seq_claim` implements this: it takes the source length from
+`kv_raw->seq_pos_max`, rejects claims longer than the request, verifies the source is a full prefix
+via the new read-only `llama_kv_cache::seq_match_prefix`, then calls `seq_cp` and returns the source
+length. Partial-prefix sharing is not supported - the compressed state cannot be rolled back
+(`seq_pos_min` already reports only the current boundary).
+
+Limitations:
+- Partial prefixes (source diverges before its end) are not claimed.
+- Cost is a full stream-buffer copy per shared request, not a reference-count bump.
+- This fights the upstream `FIXME: currently the cache only supports non-unified mode`. A change
+  this invasive to DSV4 should be discussed upstream before submission.
+
+Gotcha found while testing on DSV4 (a multimodal model):
+- `slot.prompt.tokens.has_mtmd` is set to `true` for **every** prompt when the server has a
+  multimodal context (`server-context.cpp`: `slot.prompt.tokens.has_mtmd = mctx != nullptr`), even
+  for pure text. Filtering claim sources on that flag silently disabled the whole feature on vision
+  models. The fix is `server_tokens::has_media()`, which checks whether the token list actually
+  contains a media chunk (`map_idx_to_media` non-empty).
+
+Verified on `deepseek-v4-flash` (DSV4, multimodal): a request forced to slot 1 with a prompt that
+extends slot 0's cached text claims the source prefix (`cache_n 20, prompt_n 5`) and logs
+`claimed 20 tokens from slot 1 (source slot 0, shared prefix)`.
+
 ## Suggested implementation order (incremental)
 
 1. **[DONE] A2**: add `seq_claim()` to `llama_kv_cache` (plus the `llama_memory_i` default no-op and
@@ -208,12 +247,47 @@ to the new seq_id; the slot's seq_id is added to them via `seq_add`.
    and sufficient for the first cut.
 2. **A3**: make `apply_ubatch`/`find_slot` claim (share) matching cells rather than overwrite, and
    add a unit test proving two sequences can share the same physical cells with no duplicate data.
-3. **B2 + B1**: server-side integration - pick a free slot and use `claim_prefix` for `n_past`.
-   Enable behind an existing/new server flag (e.g. reuse `kv_unified`, add `--smart-unified-cache`).
-4. **B3**: fix prompt/token bookkeeping and the release path.
-5. **Part C**: guards for shift, mtmd, n-gram/PLE.
+3. **[DONE] B2 + B1 + B3**: server-side integration. `claim_shared_prefix()` (server-context.cpp)
+   finds the source slot with the longest common prefix across the whole pool (including busy slots)
+   and claims it for the destination slot via `slot.mem.seq_claim`, only when the destination has no
+   own cached prefix. `common_memory::seq_claim()` delegates to the target context only. The
+   `--cache-sharing` flag implies `--no-cache-idle-slots` so idle slots stay live as claim sources.
+   Verified: a branch request to a fresh slot claims the root's prefix and only processes the
+   divergent tail; output matches a non-sharing run exactly.
+4. **Part C**: guards for shift, mtmd, n-gram/PLE.
+5. **[DONE] Part D**: DSV4 support via full-prefix `seq_cp` copy (see Part D above). Added the
+   read-only `llama_kv_cache::seq_match_prefix` and `llama_kv_cache_dsv4::seq_claim`. No server
+   change needed - `claim_shared_prefix()` calls `seq_claim` generically.
 6. **B4 (optional future)**: content-addressed index as a real secondary structure so claim is O(1)
    per token rather than O(pool).
+
+### Part B limitations / open questions
+
+- **Claim only fires for a destination slot with no own cached prefix.** Claiming over a slot's own
+  cached cells would leave it owning both its cells and the overlapping claimed cells (duplicate
+  content). The common case (a fresh slot claiming a root's prefix) is covered.
+- **Source slot must be idle or share its prefix stably.** Claiming from a busy slot reads its
+  already-decoded prefix cells, which is safe, but if that source later shifts/truncates, the claimed
+  cells move too. Context-shift safety is a Part C concern.
+- **`--cache-idle-slots` is disabled by `--cache-sharing`** because idle-slot clearing would free the
+  claim-source cells. If both are wanted, idle slots should instead stay live (not be cleared).
+
+  **Future improvement: make `--cache-sharing` work together with `--cache-idle-slots`.** The current
+  coupling is a blunt override - enabling `--cache-sharing` forces `--no-cache-idle-slots`, losing the
+  prompt-cache persistence (across server restarts and memory pressure) that idle-slot clearing
+  provides. A better design would let both coexist:
+
+  - Treat an idle slot's cells as a **live claim source** instead of clearing them on idle. The slot's
+    KV stays in the pool (reference-counted), so a later request can claim its prefix directly. This
+    is exactly the pool-wide claim path and avoids the serialize/clear/restore round-trip of the
+    prompt cache.
+  - Keep the prompt cache for what it is good at: **persisting state across restarts** and **evicting
+    under memory pressure**, not as the primary reuse path when `--cache-sharing` is on.
+  - Eviction policy (see the sequence-level eviction section) should then decide when an idle slot's
+    cells are actually dropped - only when the pool is full and the sequence is low-value (a leaf, not
+    a claim source). This replaces the current "clear every idle slot" behavior.
+  - The destination-slot restriction (claim only into a slot with no own prefix) also needs relaxing
+    so a reused slot can claim a better prefix from the pool instead of keeping its own shorter one.
 
 ## Activation flag
 
@@ -224,7 +298,9 @@ The feature is off by default. It is enabled only when **both** are true:
 
 The server throws at init if `--cache-sharing` is set without `--kv-unified` (server-context.cpp,
 slot setup). The `--cache-sharing` argument is registered in `common/arg.cpp`, and the field
-`common_params::cache_sharing` is declared in `common/common.h`.
+`common_params::cache_sharing` is declared in `common/common.h`. When `--cache-sharing` is on, the
+server also disables `--cache-idle-slots` (server-context.cpp), because clearing idle slots into the
+prompt cache would free the claim-source cells that a later request wants to reuse.
 
 ## Sequences vs slots: capacity and identity model
 
@@ -315,3 +391,120 @@ future claim source.
   `find_slot`/`apply_ubatch`, content index.
 - `tools/server/server-context.cpp` - slot selection, `n_past` via pool-wide claim, bookkeeping.
 - `tests/llama-context/cases-kv.cpp` - tests for sharing / claim / no-duplicate-data.
+
+## Findings and open issues from live testing (DeepSeek-V4-Flash-Vision-Exp)
+
+Test target: `deepseek-v4-flash-0731` (`unsloth/DeepSeek-V4-Flash-Vision-Exp-GGUF:UD-Q8_K_XL`,
+arch `deepseek4`) served through llama-swap on `:8080`, upstream `:10004`, launched with
+`--parallel 2 --kv-unified --cache-ram 8192 --cache-sharing`.
+
+### F1. The prompt cache shadows the claim (main open issue)
+
+`--cache-ram` is on by default and usually wins the race. In `get_available_slot` the server calls
+`ret->prompt_save()`, then `ret->prompt_load()` and restores a matching prompt from the prompt cache
+**before** `claim_shared_prefix()` runs (which happens later, in `update_slots`). When the restore
+succeeds, the destination slot already has its own prefix, so the `n_past_own == 0` gate skips the
+claim entirely.
+
+Observed: repeated identical runs produce `cache_n 40/42` on the response and `load: - found better
+prompt` in the log, but no new `claimed ... tokens` line. The claim only fired right after model
+load, when the prompt cache was empty.
+
+Consequence: today the feature is effectively a **fallback** for prompt-cache misses, not the primary
+reuse path. For the agentic branched-execution case the prompt cache already provides cross-slot
+reuse (via serialize/restore), so the claim adds little unless it is made primary.
+
+Options:
+- **A (recommended).** Prefer a live pool claim over the prompt-cache restore in
+  `get_available_slot`. The claim is a direct cell reference-count / buffer copy; the restore is a
+  serialize + deserialize round-trip. Hook the selection path so that when a live source with a
+  longer LCP exists, the restore is skipped.
+- **B.** Allow claiming into a slot that already has its own prefix. Requires a dry-run match
+  before `seq_rm`, so the destination's existing prefix is only discarded when a strictly longer
+  live prefix is available.
+- **C.** Leave as a fallback.
+
+### F2. DSV4 claim verified correct, but a clean baseline is hard to isolate
+
+Right after model load (empty prompt cache) the claim fired cleanly and the output matched a
+non-sharing run exactly:
+
+```
+seq_claim: seq_id=1 seq_src=0 n_tokens=25 src_len=20 n_base=20 n_swa=20
+claimed 20 tokens from slot 1 (source slot 0, shared prefix)
+```
+
+A high-entropy check (primes prompt, `n_predict 48`, temp 0, fixed seed) also produced byte-identical
+output between the claim/restore run and a reference run. But because the prompt cache restores the
+same prefix, the `fresh` reference was never truly fresh, and concurrent agent traffic kept
+overwriting the source slot between requests. A fully isolated claim-vs-fresh comparison still needs
+a run with `--cache-ram 0` (or the agents paused).
+
+### F3. Claim only fires for an empty destination
+
+`claim_shared_prefix()` returns 0 if the destination slot's `prompt.tokens` shares any prefix with
+the request. This avoids the destination owning both its own cells and the overlapping claimed cells
+(duplicate content). It also means a reused slot can never improve its prefix from the pool - see
+option B in F1.
+
+### F4. `seq_rm` before `seq_claim` is safe only while the F3 gate holds
+
+`claim_shared_prefix()` clears the destination with `slot.mem.seq_rm(slot.id, -1, -1)` **before**
+calling `seq_claim`. If `seq_claim` then returns 0 (possible on DSV4, see F5), the destination's
+cells have already been dropped. Today this is benign because the F3 gate guarantees the destination
+held no matching prefix, so the `seq_rm` frees nothing useful. It becomes a real hazard if the gate
+is relaxed (option B): a dry-run match must run before the `seq_rm`.
+
+### F5. DSV4 rejects partial prefixes
+
+`llama_kv_cache_dsv4::seq_claim()` takes the source length from `kv_raw->seq_pos_max` and requires
+`src_len <= n_tokens` plus a full match via `llama_kv_cache::seq_match_prefix`. A source whose
+sequence diverges before its end cannot be claimed, because the compressor state cannot be rolled
+back. So the LCP reported by `get_common_prefix()` can be positive while the claim returns 0. The
+server falls through to normal prefill in that case.
+
+### F6. DSV4 keeps its caches per-sequence even under `--kv-unified`
+
+`llama_kv_cache_dsv4` passes `unified_raw = false` / `unified_compressed = false` and ignores the
+`unified` argument. So `n_ctx` is effectively **per slot**, and the memory is per sequence.
+
+### F7. KV cache memory sizing (measured on `deepseek-v4-flash-0731`)
+
+Four K-only caches, f16, `head_count_kv = 1`, `head_dim = 512` (43 blocks):
+
+| cache | layers | compression | per-token |
+|---|---|---|---|
+| CSA compressed | 21 | 1 cell / 4 tok | 5.25 KiB |
+| LiD indexer | 21 | 1 cell / 4 tok | 1.31 KiB |
+| HCA compressed | 20 | 1 cell / 128 tok | 0.16 KiB |
+| SWA raw | 43 | windowed, fixed | ~97 MiB/seq |
+
+Startup allocation at `-c 1m --parallel 2` (from the server log):
+
+```
+SWA raw 193.50 MiB, CSA 10752.00 MiB, HCA 320.00 MiB, LiD 2688.00 MiB
+=> total 13953.5 MiB (~13.6 GiB)
+```
+
+So per sequence: ~6.72 KiB/token + ~97 MiB fixed.
+
+| context | per sequence | `--parallel 2` |
+|---|---|---|
+| 128k | ~957 MiB | ~1.9 GiB |
+| 1M | ~6.8 GiB | ~13.6 GiB |
+
+Prompt-cache (`--cache-ram`) serialized state, measured directly: ~11.8 MiB fixed + ~6.8 KiB/token
+asymptotically (base state, before context checkpoints). A saved 128k-token prompt is ~0.9 GiB, so
+`--cache-ram 8192` holds roughly 3-5 full 128k prompts including checkpoints, or many more typical
+agent-size (10k-80k) prompts.
+
+### F8. Test harness notes
+
+- llama-swap listens on `:8080`; the upstream path is
+  `http://127.0.0.1:8080/upstream/deepseek-v4-flash-0731/`. The active log is
+  `~/.config/llama-swap/stdout.log`. That log is **shared across all llama-swap models**, so
+  prompt_save/cache-state sizes must be correlated by timestamp, not read as one model.
+- `/slots/0?action=erase` returns 501 without `--slot-save-path`; there is no easy way to force a
+  fresh slot. Use `--cache-ram 0` to isolate the claim path instead.
+- Concurrent agents hitting the model overwrite slot state between test requests; pause them for
+  clean A/B runs.

@@ -1553,6 +1553,41 @@ void llama_kv_cache_dsv4::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p
     kv_raw->seq_div(seq_id, p0, p1, d);
 }
 
+uint32_t llama_kv_cache_dsv4::seq_claim(llama_seq_id seq_id, llama_seq_id seq_src, const llama_token * tokens, const llama_pos * pos, uint32_t n_tokens) {
+    if (seq_id == seq_src) {
+        return 0;
+    }
+
+    if (seq_id < 0 || seq_src < 0 || (uint32_t) seq_id >= n_seq_max || (uint32_t) seq_src >= n_seq_max) {
+        return 0;
+    }
+
+    const llama_pos src_max = kv_raw->seq_pos_max(seq_src);
+    if (src_max < 0) {
+        return 0;
+    }
+
+    const uint32_t src_len = (uint32_t) src_max + 1;
+
+    // DSV4 cannot share the compressed state or roll it back, so it reuses a prefix by copying the
+    // whole source sequence. That is only valid when the source is a complete prefix of the request.
+    if (src_len > n_tokens) {
+        return 0;
+    }
+
+    const uint32_t n_base = kv_raw->get_base()->seq_match_prefix(seq_src, tokens, pos, src_len);
+    const uint32_t n_swa  = kv_raw->get_swa ()->seq_match_prefix(seq_src, tokens, pos, src_len);
+
+    // the raw tokens live in the SWA half, but accept either half holding the full prefix
+    if (n_base < src_len && n_swa < src_len) {
+        return 0;
+    }
+
+    seq_cp(seq_src, seq_id, -1, -1);
+
+    return src_len;
+}
+
 llama_pos llama_kv_cache_dsv4::seq_pos_min(llama_seq_id seq_id) const {
     if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
         return -1;

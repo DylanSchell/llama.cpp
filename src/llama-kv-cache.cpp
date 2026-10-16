@@ -562,6 +562,34 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     //}
 }
 
+uint32_t llama_kv_cache::seq_match_prefix(llama_seq_id seq_id, const llama_token * tokens, const llama_pos * pos, uint32_t n_tokens) const {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other) {
+        return 0;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    const auto & cells = v_cells[seq_to_stream[seq_id]];
+
+    // the sequence's (pos, cell) pairs, ordered by position
+    const auto & sp = cells.seq_pos_get(seq_id);
+
+    // count each leading token whose (pos, token) matches a cached cell; stop at first mismatch or gap
+    uint32_t n = 0;
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const auto it = sp.lower_bound({ pos[i], 0 });
+        if (it == sp.end() || it->first != pos[i] || cells.ext_get(it->second).tok != tokens[i]) {
+            break;
+        }
+
+        ++n;
+    }
+
+    return n;
+}
+
 uint32_t llama_kv_cache::seq_claim(llama_seq_id seq_id, llama_seq_id seq_src, const llama_token * tokens, const llama_pos * pos, uint32_t n_tokens) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -582,37 +610,18 @@ uint32_t llama_kv_cache::seq_claim(llama_seq_id seq_id, llama_seq_id seq_src, co
         return 0;
     }
 
-    auto & cells = v_cells[s0];
+    const uint32_t n_claimed = seq_match_prefix(seq_src, tokens, pos, n_tokens);
 
-    // the source sequence's (pos, cell) pairs, ordered by position
+    auto & cells = v_cells[s0];
     const auto & sp = cells.seq_pos_get(seq_src);
 
-    // claim each token whose (pos, token) matches a source cell; stop at first mismatch or gap
-    uint32_t n_claimed = 0;
+    // a cell already owned by seq_id stays owned; only add a fresh reference
+    for (uint32_t i = 0; i < n_claimed; ++i) {
+        const uint32_t idx = sp.lower_bound({ pos[i], 0 })->second;
 
-    for (uint32_t i = 0; i < n_tokens; ++i) {
-        const llama_pos p = pos[i];
-        const llama_token tok = tokens[i];
-
-        // find the source's cell at exactly position p
-        auto it = sp.lower_bound({ p, 0 });
-        if (it == sp.end() || it->first != p) {
-            return n_claimed;
-        }
-
-        const uint32_t idx = it->second;
-
-        // the cell must carry the same token
-        if (cells.ext_get(idx).tok != tok) {
-            return n_claimed;
-        }
-
-        // a cell already owned by seq_id stays owned; only add a fresh reference
         if (!cells.seq_has(idx, seq_id)) {
             cells.seq_add(idx, seq_id);
         }
-
-        ++n_claimed;
     }
 
     return n_claimed;

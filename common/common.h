@@ -1065,6 +1065,11 @@ struct common_memory {
     void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
     void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
+
+    // claim the longest prefix of [tokens, pos) that seq_src already has, for seq_id
+    // (target context only - the draft context does not participate in pool-wide sharing)
+    uint32_t seq_claim(llama_seq_id seq_id, llama_seq_id seq_src,
+                       const llama_token * tokens, const llama_pos * pos, uint32_t n_tokens) const;
 };
 
 //
