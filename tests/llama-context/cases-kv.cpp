@@ -718,6 +718,114 @@ struct case_state_restore_fragmented : ctx_test {
     }
 };
 
+// - decode the whole prompt into seq 0
+// - claim the matching prefix for seq 1 via seq_claim (reference-counting, no data copy)
+// - drop seq 0 and verify seq 1 keeps the shared cells (one-way independent claim)
+// - generate on seq 1 and compare against the baseline
+struct case_seq_claim : ctx_test {
+    const char * name() const override { return "claim"; }
+
+    const char * description() const override {
+        return "claiming a prefix reference-counts the source cells and survives its eviction";
+    }
+
+    bool needs_baseline() const override { return true; }
+
+    case_result run(model_run & mr) const override {
+        ctx_opts opts;
+        opts.n_ctx      = 256;
+        opts.n_seq_max  = 2;
+        opts.kv_unified = 1;
+
+        auto ctx  = mr.ctx(opts);
+        auto smpl = mr.sampler();
+        if (!ctx) {
+            return case_result::fail();
+        }
+
+        const size_t n_tokens = std::min<size_t>(mr.tokens.size(), 128);
+        if (!decode_seq(ctx.get(), mr.tokens, 0, (llama_pos) n_tokens, 0, true)) {
+            TLOG_ERR("%s: failed to decode the prompt into seq 0\n", __func__);
+            return case_result::fail();
+        }
+
+        // claim the whole prompt for seq 1; it must match token-for-token
+        llama_tokens claim_tokens(mr.tokens.begin(), mr.tokens.begin() + n_tokens);
+        const uint32_t n_claimed = seq_claim(ctx.get(), 1, 0, claim_tokens, 0);
+        CTX_REQUIRE(n_claimed == n_tokens, "seq_claim did not claim the whole matching prefix");
+
+        // evict seq 0 - seq 1 must keep the shared cells (reference counting)
+        if (!seq_rm(ctx.get(), 0)) {
+            TLOG_ERR("%s: failed to remove seq 0\n", __func__);
+            return case_result::fail();
+        }
+
+        int n_past = (int) n_tokens;
+        if (!generate_tokens_compare(ctx.get(), smpl.get(), n_past, mr.params.n_predict, 1, mr.baseline, NMSE_THRESHOLD)) {
+            return case_result::fail();
+        }
+
+        return case_result::pass();
+    }
+};
+
+// - decode the whole prompt into seq 0
+// - claim only a partial prefix (fewer tokens than the prompt) for seq 1
+// - verify the claim stops at the requested length and seq 1 continues correctly
+struct case_seq_claim_partial : ctx_test {
+    const char * name() const override { return "claim_partial"; }
+
+    const char * description() const override {
+        return "claiming a partial prefix stops at the requested length and leaves seq 1 usable";
+    }
+
+    bool needs_baseline() const override { return true; }
+
+    case_result run(model_run & mr) const override {
+        ctx_opts opts;
+        opts.n_ctx      = 256;
+        opts.n_seq_max  = 2;
+        opts.kv_unified = 1;
+
+        auto ctx  = mr.ctx(opts);
+        auto smpl = mr.sampler();
+        if (!ctx) {
+            return case_result::fail();
+        }
+
+        const size_t n_tokens = std::min<size_t>(mr.tokens.size(), 128);
+        const size_t n_claim  = n_tokens / 2;
+
+        if (!decode_seq(ctx.get(), mr.tokens, 0, (llama_pos) n_tokens, 0, true)) {
+            TLOG_ERR("%s: failed to decode the prompt into seq 0\n", __func__);
+            return case_result::fail();
+        }
+
+        llama_tokens claim_tokens(mr.tokens.begin(), mr.tokens.begin() + n_claim);
+        const uint32_t n_claimed = seq_claim(ctx.get(), 1, 0, claim_tokens, 0);
+        CTX_REQUIRE(n_claimed == n_claim, "seq_claim did not claim the requested partial prefix");
+
+        // drop seq 0 so seq 1 owns the claimed cells alone
+        if (!seq_rm(ctx.get(), 0)) {
+            TLOG_ERR("%s: failed to remove seq 0\n", __func__);
+            return case_result::fail();
+        }
+
+        // finish decoding the remaining tokens on seq 1, starting after the claimed prefix
+        if (!decode_seq(ctx.get(), mr.tokens, (llama_pos) n_claim, (llama_pos) n_tokens, 1, true)) {
+            TLOG_ERR("%s: failed to decode the remaining prompt on seq 1\n", __func__);
+            return case_result::fail();
+        }
+
+        int n_past = (int) n_tokens;
+        if (!generate_tokens_compare(ctx.get(), smpl.get(), n_past, mr.params.n_predict, 1, mr.baseline, NMSE_THRESHOLD)) {
+            return case_result::fail();
+        }
+
+        return case_result::pass();
+    }
+};
+
 std::vector<ctx_test_ptr> make_kv_cases() {
     std::vector<ctx_test_ptr> cases;
 
@@ -728,6 +836,8 @@ std::vector<ctx_test_ptr> make_kv_cases() {
     cases.push_back(std::make_unique<case_seq_cp>(true));
     cases.push_back(std::make_unique<case_seq_cp_scatter>(false));
     cases.push_back(std::make_unique<case_seq_cp_scatter>(true));
+    cases.push_back(std::make_unique<case_seq_claim>());
+    cases.push_back(std::make_unique<case_seq_claim_partial>());
     cases.push_back(std::make_unique<case_state_roundtrip>());
     cases.push_back(std::make_unique<case_state_partial_size>());
     cases.push_back(std::make_unique<case_state_restore_failure>());

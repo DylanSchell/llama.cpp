@@ -1388,6 +1388,11 @@ private:
             SRV_TRC("%s", "speculative decoding will use checkpoints\n");
         }
 
+        // pool-wide cache sharing requires the unified KV pool
+        if (params_base.cache_sharing && !params_base.kv_unified) {
+            throw std::runtime_error("--cache-sharing requires --kv-unified");
+        }
+
         // setup slots
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");

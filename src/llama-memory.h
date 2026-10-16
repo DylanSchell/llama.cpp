@@ -114,6 +114,25 @@ struct llama_memory_i {
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
 
+    // Claim the longest prefix of [tokens, pos) that sequence seq_src already has in the cache,
+    // reference-counting the matching cells for sequence seq_id. The claim is one-way and
+    // independent: seq_id keeps the shared cells even if seq_src is later evicted.
+    // Returns the number of tokens claimed (= the new n_past).
+    // Default no-op returns 0 - memory types that cannot share cells do not claim.
+    virtual uint32_t seq_claim(
+            llama_seq_id seq_id,
+            llama_seq_id seq_src,
+            const llama_token * tokens,
+            const llama_pos   * pos,
+            uint32_t n_tokens) {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(seq_src);
+        GGML_UNUSED(tokens);
+        GGML_UNUSED(pos);
+        GGML_UNUSED(n_tokens);
+        return 0;
+    }
+
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 

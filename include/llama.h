@@ -802,6 +802,19 @@ extern "C" {
                  llama_pos p1,
                        int d);
 
+    // Claim the longest prefix of [tokens, pos) that sequence seq_src already has in the memory,
+    // reference-counting the matching cells for sequence seq_id. The claim is one-way and
+    // independent: seq_id keeps the shared cells even if seq_src is later evicted.
+    // Returns the number of tokens claimed (= the new n_past).
+    // Memory types that cannot share cells return 0 (no claim).
+    LLAMA_API uint32_t llama_memory_seq_claim(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+              llama_seq_id seq_src,
+     const llama_token * tokens,
+     const llama_pos   * pos,
+          uint32_t n_tokens);
+
     // Returns the smallest position present in the memory for the specified sequence
     // This is typically non-zero only for SWA caches
     // Note that all positions in the range [pos_min, pos_max] are guaranteed to be present in the memory

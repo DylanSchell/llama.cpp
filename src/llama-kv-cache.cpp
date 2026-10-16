@@ -562,6 +562,62 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     //}
 }
 
+uint32_t llama_kv_cache::seq_claim(llama_seq_id seq_id, llama_seq_id seq_src, const llama_token * tokens, const llama_pos * pos, uint32_t n_tokens) {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other) {
+        return 0;
+    }
+
+    GGML_ASSERT(seq_id   >= 0 && (size_t) seq_id   < seq_to_stream.size());
+    GGML_ASSERT(seq_src  >= 0 && (size_t) seq_src  < seq_to_stream.size());
+
+    // pool-wide claim only makes sense within a single stream (always true in unified mode)
+    const auto s0 = seq_to_stream[seq_id];
+    const auto s1 = seq_to_stream[seq_src];
+    if (s0 != s1) {
+        return 0;
+    }
+
+    if (seq_id == seq_src) {
+        return 0;
+    }
+
+    auto & cells = v_cells[s0];
+
+    // the source sequence's (pos, cell) pairs, ordered by position
+    const auto & sp = cells.seq_pos_get(seq_src);
+
+    // claim each token whose (pos, token) matches a source cell; stop at first mismatch or gap
+    uint32_t n_claimed = 0;
+
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const llama_pos p = pos[i];
+        const llama_token tok = tokens[i];
+
+        // find the source's cell at exactly position p
+        auto it = sp.lower_bound({ p, 0 });
+        if (it == sp.end() || it->first != p) {
+            return n_claimed;
+        }
+
+        const uint32_t idx = it->second;
+
+        // the cell must carry the same token
+        if (cells.ext_get(idx).tok != tok) {
+            return n_claimed;
+        }
+
+        // a cell already owned by seq_id stays owned; only add a fresh reference
+        if (!cells.seq_has(idx, seq_id)) {
+            cells.seq_add(idx, seq_id);
+        }
+
+        ++n_claimed;
+    }
+
+    return n_claimed;
+}
+
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {

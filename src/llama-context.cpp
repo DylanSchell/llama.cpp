@@ -4451,6 +4451,20 @@ void llama_memory_seq_div(
     mem->seq_div(seq_id, p0, p1, d);
 }
 
+uint32_t llama_memory_seq_claim(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+          llama_seq_id seq_src,
+     const llama_token * tokens,
+     const llama_pos   * pos,
+          uint32_t n_tokens) {
+    if (!mem) {
+        return 0;
+    }
+
+    return mem->seq_claim(seq_id, seq_src, tokens, pos, n_tokens);
+}
+
 llama_pos llama_memory_seq_pos_min(
         llama_memory_t mem,
           llama_seq_id seq_id) {
