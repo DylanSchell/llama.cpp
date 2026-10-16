@@ -244,6 +244,17 @@ bool seq_rm(llama_context * ctx, llama_seq_id seq_id) {
     return true;
 }
 
+uint32_t seq_claim(llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_src,
+                   const llama_tokens & tokens, llama_pos pos_begin) {
+    std::vector<llama_pos> pos(tokens.size());
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        pos[i] = pos_begin + (llama_pos) i;
+    }
+
+    return llama_memory_seq_claim(llama_get_memory(ctx), seq_id, seq_src,
+                                  tokens.data(), pos.data(), (uint32_t) tokens.size());
+}
+
 bool load_state_replay_last(llama_context * ctx, const std::string & path, const llama_tokens & tokens, int & n_past) {
     llama_tokens unused_sts(tokens.size());
     size_t n_token_count_out = 0;

@@ -92,6 +92,10 @@ bool set_seq_state(llama_context * ctx, llama_seq_id seq_id, uint32_t flags, con
 // drop a sequence entirely
 bool seq_rm(llama_context * ctx, llama_seq_id seq_id);
 
+// claim the longest prefix of [tokens, pos) that seq_src already has, for seq_id
+uint32_t seq_claim(llama_context * ctx, llama_seq_id seq_id, llama_seq_id seq_src,
+                   const llama_tokens & tokens, llama_pos pos_begin);
+
 // load a saved session and replay its last token, leaving n_past ready for the next token
 bool load_state_replay_last(llama_context * ctx, const std::string & path, const llama_tokens & tokens, int & n_past);
 
