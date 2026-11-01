@@ -8,6 +8,7 @@ constant short FC_mul_mm_ne13  [[function_constant(FC_MUL_MM + 3)]];
 constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant int32_t FC_mul_mm_id_map0_ne02 [[function_constant(FC_MUL_MM + 7)]];
+constant bool FC_mul_mm_bc_scale [[function_constant(FC_MUL_MM + 6)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -21,6 +22,7 @@ kernel void kernel_mul_mm(
         device const char * srcA,
         device const char * srcB,
         device       char * dst,
+        device const float * scale,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig [[threadgroup_position_in_grid]],
         ushort tiitg [[thread_index_in_threadgroup]],
@@ -104,6 +106,9 @@ kernel void kernel_mul_mm(
 
                     SA_4x4 temp_a;
                     dequantize_func(row_ptr + block_idx, il, temp_a);
+                    if (FC_mul_mm_bc_scale) {
+                        temp_a = temp_a * (SA) scale[0];
+                    }
 
                     FOR_UNROLL (short i = 0; i < 16; i++) {
                         // Zero-pad A for K positions beyond valid range (handles partial K iterations)
@@ -157,6 +162,7 @@ kernel void kernel_mul_mm(
         device const char * src0,
         device const char * src1,
         device       char * dst,
+        device const float * scale,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -319,7 +325,7 @@ kernel void kernel_mul_mm(
         }
     }
 
-    if (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1)) {
+    if (!FC_mul_mm_bc_scale && (!FC_mul_mm_bc_out || (r0 + NR0 <= args.ne0 && r1 + NR1 <= args.ne1))) {
         // if no bounds checks on the output are needed, we can directly write to device memory
         device float * C = (device float *) dst +
             (r0 + 32*(sgitg &  1)) + \
@@ -340,6 +346,8 @@ kernel void kernel_mul_mm(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
+        const float sc = FC_mul_mm_bc_scale ? scale[0] : 1.0f;
+
         if (sgitg == 0) {
             for (int j = tiitg; j < nr1; j += NR1) {
                 device float  * D  = (device float  *) dst + r0 + (uint64_t) (r1 + j)*args.ne0 + (uint64_t) im*args.ne1*args.ne0;
@@ -350,12 +358,12 @@ kernel void kernel_mul_mm(
 
                 int i = 0;
                 for (; i < nr0/4; i++) {
-                    *(D4 + i) = *(C4 + i);
+                    *(D4 + i) = *(C4 + i) * sc;
                 }
 
                 i *= 4;
                 for (; i < nr0; i++) {
-                    *(D + i) = *(C + i);
+                    *(D + i) = *(C + i) * sc;
                 }
             }
         }
@@ -553,6 +561,7 @@ kernel void kernel_mul_mm_id(
         device const char * htpe,
         device const char * hids,
         device       char * dst,
+        device const float * scale,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -862,6 +871,8 @@ kernel void kernel_mul_mm_id(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    const float sc = FC_mul_mm_bc_scale ? scale[im] : 1.0f;
+
     for (short j = sgitg; j < nr1; j += 4) {
         const int id = ids_i32[idb + j];
 
@@ -876,12 +887,12 @@ kernel void kernel_mul_mm_id(
 
         int i = tiisg;
         for (; i < nr0/4; i += 32) {
-            *(D4 + i) = *(C4 + i);
+            *(D4 + i) = *(C4 + i) * sc;
         }
 
         i = (4*(nr0/4)) + tiisg;
         for (; i < nr0; i += 32) {
-            *(D + i) = *(C + i);
+            *(D + i) = *(C + i) * sc;
         }
     }
 }

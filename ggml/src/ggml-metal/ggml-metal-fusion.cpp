@@ -711,6 +711,104 @@ static bool ggml_metal_fusion_check_mul_mat_add(
         (add->data == res->data || !ggml_metal_fusion_overlap(add, res));
 }
 
+// MUL_MAT + MUL of a scalar f32 weight (NVFP4 scale2): the scale is folded into the matmul output,
+// so the trailing MUL is elided. equivalent because (W @ x) * s == (W * s) @ x for a scalar s
+static bool ggml_metal_fusion_check_mul_mat_scale(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+
+    const ggml_tensor * mm  = nodes[0];
+    const ggml_tensor * mul = nodes[1];
+
+    // scale2 only applies to these quantized weight types
+    if (mm->src[0]->type != GGML_TYPE_NVFP4 && mm->src[0]->type != GGML_TYPE_F8_E4M3) {
+        return false;
+    }
+
+    // MUL must read the matmul output as src0 and the scale as src1
+    if (mul->src[0] != mm || mul->src[1] == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * scale = mul->src[1];
+
+    // the scale is a single f32 scalar
+    if (scale->type != GGML_TYPE_F32 || scale->ne[0] != 1 || scale->ne[1] != 1 ||
+        scale->ne[2] != 1 || scale->ne[3] != 1) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        if (scale->data == nullptr) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// MUL_MAT_ID + RESHAPE + REPEAT + GET_ROWS + MUL of a per-expert f32 scale (NVFP4 scale2):
+// the per-expert scale is folded into the matmul output (W[e] @ x) * s[e] == (W[e] * s[e]) @ x,
+// so the RESHAPE/REPEAT/GET_ROWS/MUL chain is elided
+static bool ggml_metal_fusion_check_mul_mat_id_scale(
+        const ggml_metal_fusion       * fusion,
+        const ggml_tensor * const     * nodes,
+        const ggml_cgraph             * gf,
+        const int                     * node_idxs,
+              int                       idx,
+              ggml_metal_fusion_mode    mode) {
+    const int n_ops = (int) fusion->ops.size();
+
+    const ggml_tensor * mm       = nodes[0];
+    const ggml_tensor * repeat   = nodes[1];
+    const ggml_tensor * get_rows = nodes[2];
+    const ggml_tensor * mul      = nodes[3];
+
+    if (mm->src[0]->type != GGML_TYPE_NVFP4 && mm->src[0]->type != GGML_TYPE_F8_E4M3) {
+        return false;
+    }
+
+    // repeat reads the no-copy reshape, which reads the per-expert scale
+    const ggml_tensor * reshape = repeat->src[0];
+    if (!reshape || reshape->op != GGML_OP_RESHAPE || reshape->src[0] == nullptr) {
+        return false;
+    }
+    const ggml_tensor * scale = reshape->src[0];
+
+    // wiring: get_rows(repeat, ids), mul(mm, get_rows)
+    if (get_rows->src[0] != repeat || get_rows->src[1] != mm->src[2] ||
+        mul->src[0] != mm || mul->src[1] != get_rows) {
+        return false;
+    }
+
+    // per-expert f32 scale: one value per expert
+    if (scale->type != GGML_TYPE_F32 || scale->ne[0] != mm->src[0]->ne[2]) {
+        return false;
+    }
+
+    if (mode == GGML_METAL_FUSION_FULL) {
+        if (scale->data == nullptr) {
+            return false;
+        }
+    }
+
+    // structural subgraph check over the filtered (non-empty) sequence
+    const int outputs[1] = { node_idxs[idx + n_ops - 1] };
+    if (!ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, n_ops, fusion->ops.data(), outputs, 1)) {
+        return false;
+    }
+
+    return true;
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -762,6 +860,10 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
 
+static const std::vector<ggml_op> ops_mul_mat_scale = { GGML_OP_MUL_MAT, GGML_OP_MUL };
+
+static const std::vector<ggml_op> ops_mul_mat_id_scale = { GGML_OP_MUL_MAT_ID, GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_MUL };
+
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_MUL_ADD,   ops_norm_mul_add,           {},     false, ggml_metal_fusion_check_norm },
@@ -790,6 +892,8 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+    { GGML_METAL_FUSION_MUL_MAT_SCALE,  ops_mul_mat_scale,          {},     false, ggml_metal_fusion_check_mul_mat_scale },
+    { GGML_METAL_FUSION_MUL_MAT_ID_SCALE, ops_mul_mat_id_scale,     {},     true,  ggml_metal_fusion_check_mul_mat_id_scale },
 };
 
 // ---- alloc deps -----------------------------------------------------------

@@ -214,6 +214,7 @@ constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
 constant short FC_mul_mv_r2    [[function_constant(FC_MUL_MV + 3)]];
 constant short FC_mul_mv_r3    [[function_constant(FC_MUL_MV + 4)]];
 constant bool  FC_mul_mv_split [[function_constant(FC_MUL_MV + 5)]];
+constant bool  FC_mul_mv_id_bc_scale [[function_constant(FC_MUL_MV + 6)]];
 
 template<typename block_q_type, short NR0, typename args_t>
 void mul_vec_q_n_f32_impl(
@@ -3412,6 +3413,7 @@ kernel void kernel_mul_mv_id(
         device const char * src1,
         device       char * dst,
         device const char * ids,
+        device const float * scale,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
@@ -3477,6 +3479,21 @@ kernel void kernel_mul_mv_id(
         tiitg,
         tiisg,
         sgitg);
+
+    if (FC_mul_mv_id_bc_scale) {
+        // NVFP4 scale2: apply the per-expert scale to the matvec result in f32,
+        // matching the unfused (W @ x) * s[e] semantics exactly. only scale the
+        // rows this threadgroup wrote (same tiisg==0 lane mapping as disp_fn),
+        // so no cross-thread or cross-threadgroup synchronization is needed.
+        const float sc = scale[i02];
+        device float * dst_f32 = (device float *) dst_cur;
+        const int first_row = (tgpig.x * ntg.y + sgitg) * args.nr0;
+        for (int row = 0; row < args.nr0 && first_row + row < args.ne0; ++row) {
+            if (tiisg == 0) {
+                dst_f32[first_row + row] *= sc;
+            }
+        }
+    }
 }
 
 typedef decltype(kernel_mul_mv_id<mmv_fn<kernel_mul_mv_t_t_disp<float, float>>>) kernel_mul_mv_id_t;
