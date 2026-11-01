@@ -379,6 +379,25 @@ void dequantize_mxfp4_t4(device const block_mxfp4 * xb, short il, thread type4 &
 }
 
 template <typename type4x4>
+void dequantize_nvfp4(device const block_nvfp4 * xb, short il, thread type4x4 & reg) {
+    const float d = ue4m3_to_fp32(xb->d[il]);
+    device const uint8_t * q2 = xb->qs + 8*il;
+
+    float4x4 reg_f;
+
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            const int e = 4*i + j;
+            const uint8_t b = q2[e & 7];
+            const uint8_t q = e < 8 ? (b & 0x0F) : (b >> 4);
+            reg_f[i][j] = d * kvalues_mxfp4_f[q];
+        }
+    }
+
+    reg = (type4x4) reg_f;
+}
+
+template <typename type4x4>
 void dequantize_q2_K(device const block_q2_K *xb, short il, thread type4x4 & reg) {
     const float d = xb->d;
     const float min = xb->dmin;

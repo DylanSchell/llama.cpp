@@ -68,6 +68,24 @@ static inline float e8m0_to_fp32(uint8_t x) {
     return as_type<float>(bits);
 }
 
+// UE4M3: unsigned 4-bit exponent (bias 7), 3-bit mantissa. unlike the ggml reference this returns
+// the raw scale, since kvalues_mxfp4_f holds the actual E2M1 values while the CPU pairs the *0.5
+// scale with a doubled int8 table.
+static inline float ue4m3_to_fp32(uint8_t x) {
+    if (x == 0 || x == 0x7F) {
+        return 0.0f;
+    }
+
+    const int exp = (x >> 3) & 0xF;
+    const int man = x & 0x7;
+
+    if (exp == 0) {
+        return ldexp((float) man, -9);
+    }
+
+    return ldexp(1.0f + (float) man / 8.0f, exp - 7);
+}
+
 static inline float dot(float x, float y) {
     return x*y;
 }
