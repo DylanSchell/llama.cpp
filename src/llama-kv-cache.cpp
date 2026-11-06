@@ -1327,6 +1327,10 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+uint32_t llama_kv_cache::get_n_swa() const {
+    return n_swa;
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 

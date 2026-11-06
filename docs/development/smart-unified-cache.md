@@ -238,6 +238,68 @@ Verified on `deepseek-v4-flash` (DSV4, multimodal): a request forced to slot 1 w
 extends slot 0's cached text claims the source prefix (`cache_n 20, prompt_n 5`) and logs
 `claimed 20 tokens from slot 1 (source slot 0, shared prefix)`.
 
+### Part E - iSWA support (window-bounded cell sharing)
+
+`llama_kv_cache_iswa` (gemma, llama4, gpt-oss, ...) stacks a base cache (non-SWA layers, holds every
+position) and an SWA cache (SWA layers, evicts cells outside the window). Both halves must claim,
+and the SWA half bounds what can be claimed:
+
+- The base half claims the longest matching prefix, as in the plain cache. This bounds the claim.
+- The SWA layers only attend to the `n_swa` positions before the first unclaimed one, so cells older
+  than that window (`w_begin = pos[n-1] - n_swa + 2`) are not needed. The SWA claim therefore starts
+  at `w_begin`, not at the prefix start - a forward walk from position 0 would stop at the first
+  evicted cell and claim nothing useful.
+- The source's SWA half evicts lazily (only when cells are needed), so it may still hold cells well
+  outside its window. Whether the needed window is covered is decided by verifying the SWA tail
+  with the read-only `seq_match_prefix` before claiming anything, never by assuming retention.
+- If the SWA tail does not match contiguously (the source generated far past the claimed prefix and
+  its window slid ahead), the claim is refused. Validating before mutating keeps the two halves from
+  ending up with different claim lengths.
+
+The claim test (`claim`, `claim_partial` in tests/llama-context/cases-kv.cpp) skips memory types
+that return no claim (recurrent, hybrid, DSA, MSA) instead of failing on them.
+
+### Part F - integration with the reference-counted server checkpoints
+
+Upstream #30137 changed the server to share checkpoints between slots and the prompt cache
+(`std::list<std::shared_ptr<const common_prompt_checkpoint>>`) instead of deep-copying them. The
+cell-level claim and the checkpoint sharing are complementary layers of the same idea, and they
+interact in four places:
+
+1. **Claimed cells never leak into a checkpoint restore.** `state_read_meta()` begins with
+   `seq_rm(dest_seq_id, -1, -1)`: restoring a checkpoint first releases the slot's membership of ALL
+   its cells, claimed shared ones included. The source keeps the shared cells alive (one-way
+   independent claim), and the slot gets a private, self-contained cell set from the checkpoint's
+   serialized copy. No duplicate positions.
+2. **Checkpoints of a claimed sequence are self-contained.** `state_write_meta` serializes every
+   cell the sequence touches, shared cells included, by value. A checkpoint taken on a slot that
+   claimed its prefix restores correctly even after the source slot is gone.
+3. **A claim must erase the slot's stale checkpoints.** `claim_shared_prefix()` replaces
+   `slot.prompt.tokens` with the claimed prefix, so existing checkpoints (which describe the
+   replaced prompt) would restore KV data that does not match the claimed cells. It now clears
+   `slot.prompt.checkpoints` when the claim succeeds. The prompt cache keeps its own shared_ptr
+   copies, so nothing is lost for cache entries.
+4. **The `n_prefix` guard stays correct.** Master computes `n_prefix` after the claim, and clamps
+   (`n_tokens_shared`, decision, alora, the evaluate-at-least-one-token rule) can pull `n_past`
+   below the claimed length. That is safe: the generic `seq_rm(slot.id, pos_next(), -1)` before
+   batch filling releases the claimed cells beyond the clamped `n_past` for this slot only, and the
+   released tokens are re-processed into fresh cells.
+
+### Part G - pre-existing issues surfaced by the claim tests
+
+The claim tests exercise unified-cache decode against the split-decode baseline, which exposed two
+independent, pre-existing issues (neither is introduced by `seq_claim`):
+
+- **cogvlm computes different logits in unified mode** than the split-decode baseline, before any
+  claim happens (`llama-perplexity` confirms it: 127.77 plain vs 130.27 with `--kv-unified`). The
+  claim cases skip `LLM_ARCH_COGVLM` rather than misreport the step-0 mismatch as a claim failure.
+- **DSV4's copy-based claim is fragile when the source is evicted.** `seq_cp` defers the compressed
+  state copy to the next decode, but `seq_rm` zeroes the source's compressed state synchronously, so
+  "claim then evict source" copies zeroed data (a forced device sync, e.g. a logits read between the
+  two, makes it deterministic). DSV4 claims full prefixes only, and the test covers only that path;
+  a production deployment with `--cache-sharing` on DSV4 should be treated as experimental until the
+  upstream compressed-cache copy/clear ordering is fixed.
+
 ## Suggested implementation order (incremental)
 
 1. **[DONE] A2**: add `seq_claim()` to `llama_kv_cache` (plus the `llama_memory_i` default no-op and

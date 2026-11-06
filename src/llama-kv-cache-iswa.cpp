@@ -139,6 +139,40 @@ void llama_kv_cache_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p
     kv_swa ->seq_div(seq_id, p0, p1, d);
 }
 
+uint32_t llama_kv_cache_iswa::seq_claim(llama_seq_id seq_id, llama_seq_id seq_src, const llama_token * tokens, const llama_pos * pos, uint32_t n_tokens) {
+    if (seq_id == seq_src) {
+        return 0;
+    }
+
+    // the non-SWA layers attend to every position, so the claim is bounded by the base half
+    const uint32_t n_base = kv_base->seq_match_prefix(seq_src, tokens, pos, n_tokens);
+    if (n_base == 0) {
+        return 0;
+    }
+
+    // the SWA layers only attend to a bounded window before the first unclaimed position, so cells
+    // older than that window are not needed: the source may have evicted them, or not - the SWA walk
+    // below verifies whichever cells it actually needs
+    const llama_pos w_begin = std::max(pos[0], pos[n_base - 1] - (llama_pos) kv_swa->get_n_swa() + 2);
+
+    // the SWA claim walk must start inside the source's retained window, so skip the older positions
+    uint32_t i0 = 0;
+    while (i0 < n_base && pos[i0] < w_begin) {
+        ++i0;
+    }
+
+    // validate the SWA tail before claiming anything, so a fragmented window cannot leave the two
+    // halves with different claim lengths
+    if (kv_swa->seq_match_prefix(seq_src, tokens + i0, pos + i0, n_base - i0) != n_base - i0) {
+        return 0;
+    }
+
+    kv_base->seq_claim(seq_id, seq_src, tokens, pos, n_base);
+    kv_swa ->seq_claim(seq_id, seq_src, tokens + i0, pos + i0, n_base - i0);
+
+    return n_base;
+}
+
 llama_pos llama_kv_cache_iswa::seq_pos_min(llama_seq_id seq_id) const {
     // the base cache is a superset of the SWA cache, so we can just check the SWA cache
     return kv_swa->seq_pos_min(seq_id);
